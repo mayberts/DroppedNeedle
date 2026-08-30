@@ -15430,15 +15430,15 @@ class NativeLibraryStore(PersistenceBase):
                         operation_job_id=job_id,
                         now=now,
                     )
-                if applied is None:
-                    applied = self._delete_orphaned_album_shell_tx(
-                        connection,
-                        album=album,
-                        operation_job_id=job_id,
-                        work_ordinal=ordinal,
-                        worker_id=worker_id,
-                        now=now,
-                    )
+                # HOTFIX (disabled): _delete_orphaned_album_shell_tx was wired
+                # in here to garbage-collect empty automatic shells, but it
+                # started deleting local_albums rows for albums that were
+                # still current in production (see mayberts/DroppedNeedle#1
+                # follow-up) - likely a race with an in-progress scan/regroup
+                # that the blocking-reference checks didn't fully cover. Left
+                # disabled until that's root-caused; do not re-enable this
+                # call without reproducing and fixing the false-positive
+                # first.
             changed = applied is not None
             catalog_revision = (
                 self._bump_catalog(connection)

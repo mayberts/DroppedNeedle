@@ -717,6 +717,11 @@ async def test_unique_empty_automatic_shell_retires_and_preserves_alias(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip(
+    reason="_delete_orphaned_album_shell_tx is disabled pending investigation "
+    "into false-positive deletes seen in production (mayberts/DroppedNeedle#1 "
+    "follow-up) - re-enable once the call site is restored."
+)
 async def test_empty_automatic_shell_with_no_successor_is_deleted(
     store: NativeLibraryStore, db_path: Path
 ) -> None:
