@@ -14952,6 +14952,168 @@ class NativeLibraryStore(PersistenceBase):
         )
         return after
 
+    # Tables (other than local_tracks, checked separately) that carry a
+    # foreign key to local_albums(id) with ON DELETE RESTRICT and represent
+    # real state - if any of these still reference an empty shell, deleting
+    # it would either fail on the FK or silently drop history/user data, so
+    # its presence blocks the delete rather than being cleared.
+    _ALBUM_ORPHAN_BLOCKING_REFERENCES: tuple[tuple[str, str], ...] = (
+        ("local_album_external_identities", "local_album_id"),
+        ("library_album_release_pins", "local_album_id"),
+        ("library_play_history", "local_album_id"),
+        ("library_playlist_tracks", "local_album_id"),
+        ("library_identification_attempts", "local_album_id"),
+        ("library_artist_credit_proofs", "local_album_id"),
+        ("library_artist_reconciliation_state", "local_album_id"),
+        ("library_identification_reviews", "local_album_id"),
+        ("library_identification_jobs", "local_album_id"),
+        ("library_management_overrides", "local_album_id"),
+        ("library_management_plan_items", "local_album_id"),
+        ("library_reidentification_snapshots", "local_album_id"),
+        ("library_identity_repair_findings", "local_album_id"),
+        ("library_catalog_actions", "local_album_id"),
+        ("library_automatic_edition_undo", "local_album_id"),
+        ("library_scan_management_candidates", "local_album_id"),
+        ("library_scan_grouping_evidence", "old_album_id"),
+        ("library_scan_grouping_edges", "old_album_id"),
+        ("library_scan_grouping_old_nodes", "old_album_id"),
+        ("library_scan_grouping_new_nodes", "matched_old_album_id"),
+        ("library_scan_grouping_groups", "retained_album_id"),
+        ("local_entity_source_links", "local_album_id"),
+        ("library_contribution_drafts", "local_album_id"),
+        ("library_custom_edition_manifests", "local_album_id"),
+        ("library_custom_edition_active", "local_album_id"),
+        ("library_management_exclusions", "local_album_id"),
+        ("library_edition_conversion_jobs", "local_album_id"),
+        ("local_album_aliases", "local_album_id"),
+        ("local_albums", "retired_into_album_id"),
+    )
+
+    @classmethod
+    def _delete_orphaned_album_shell_tx(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        album: sqlite3.Row,
+        operation_job_id: str,
+        work_ordinal: int,
+        worker_id: str,
+        now: float,
+    ) -> dict[str, Any] | None:
+        """Physically remove an automatic, empty album shell that has no
+        merge successor and carries no other state anywhere in the schema.
+
+        Local album ids are deterministic hashes of (root, directory, title,
+        artist) - see library_indexer.py - not opaque row keys, so deleting
+        the row is safe: if the exact same folder/tags reappear on a later
+        scan, the identical id is recomputed and the album resurfaces under
+        the same URL. Without this, a shell that _retire_empty_album_shell_tx
+        can't merge (no unambiguous successor) lingers in local_albums
+        forever - it still resolves as a "known" id (so callers get no
+        redirect) but never has indexed tracks, so every read 404s
+        indefinitely for whatever still holds that id.
+
+        The caller's own library_operation_work lease row references this
+        album (ON DELETE RESTRICT), so it can't simply be left in place: this
+        finishes and removes that lease itself - mirroring what
+        _finish_artist_reconciliation_work_tx would have done - instead of
+        deferring to it, since by the time that helper would run the album
+        row (and the FK it's about to check) is already gone. The caller must
+        skip its own call to that helper whenever this returns a result.
+        """
+        if str(album["grouping_source"]) != "automatic" or bool(
+            album["grouping_locked"]
+        ):
+            return None
+        if connection.execute(
+            "SELECT 1 FROM local_tracks WHERE local_album_id = ? LIMIT 1",
+            (album["id"],),
+        ).fetchone():
+            return None
+        # The hygiene work item invoking this always owns exactly one
+        # library_operation_work row for this album (its own running lease)
+        # - exclude it, but still block on any other work referencing it.
+        if connection.execute(
+            "SELECT 1 FROM library_operation_work WHERE local_album_id = ? "
+            "AND NOT (job_id = ? AND ordinal = ?) LIMIT 1",
+            (album["id"], operation_job_id, work_ordinal),
+        ).fetchone():
+            return None
+        for table, column in cls._ALBUM_ORPHAN_BLOCKING_REFERENCES:
+            if connection.execute(
+                f"SELECT 1 FROM {table} WHERE {column} = ? LIMIT 1",
+                (album["id"],),
+            ).fetchone():
+                return None
+        after = {
+            "kind": "delete_orphaned_album_shell",
+            "deleted_album_id": str(album["id"]),
+            "filesystem_writes": 0,
+        }
+        finished = connection.execute(
+            "UPDATE library_operation_work SET state = 'succeeded', "
+            "result_json = ?, failure_code = NULL, updated_at = ?, "
+            "row_revision = row_revision + 1 "
+            "WHERE job_id = ? AND ordinal = ? AND state = 'running' "
+            "RETURNING ordinal",
+            (
+                json.dumps(after, separators=(",", ":"), sort_keys=True),
+                now,
+                operation_job_id,
+                work_ordinal,
+            ),
+        ).fetchone()
+        if finished is None:
+            raise StaleRevisionError("The artist reconciliation work lease changed.")
+        job_updated = connection.execute(
+            "UPDATE library_operation_jobs SET completed_count = completed_count + 1, "
+            "succeeded_count = succeeded_count + 1, updated_at = ?, "
+            "row_revision = row_revision + 1, event_revision = event_revision + 1 "
+            "WHERE id = ? AND kind = 'repair' AND state = 'running' AND lease_owner = ?",
+            (now, operation_job_id, worker_id),
+        )
+        if job_updated.rowcount != 1:
+            raise StaleRevisionError("The artist reconciliation job lease changed.")
+        # Now that no library_operation_work row references this album, the
+        # RESTRICT foreign keys below (and on local_albums itself) are clear.
+        connection.execute(
+            "DELETE FROM library_operation_work WHERE job_id = ? AND ordinal = ?",
+            (operation_job_id, work_ordinal),
+        )
+        connection.execute(
+            "DELETE FROM local_album_artwork WHERE local_album_id = ?",
+            (album["id"],),
+        )
+        connection.execute(
+            "DELETE FROM local_album_artists WHERE local_album_id = ?",
+            (album["id"],),
+        )
+        connection.execute("DELETE FROM local_albums WHERE id = ?", (album["id"],))
+        # local_album_id can't reference the row we just deleted (ON DELETE
+        # RESTRICT would have blocked the delete), so this action anchors on
+        # the album's artist instead - still satisfies the "at least one
+        # subject" CHECK on library_catalog_actions.
+        connection.execute(
+            "INSERT OR IGNORE INTO library_catalog_actions "
+            "(id, idempotency_key, actor_user_id, action_kind, local_artist_id, "
+            "operation_job_id, before_json, after_json, reason_code, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                str(uuid.uuid4()),
+                f"catalog-hygiene:delete-empty-shell:{album['id']}",
+                None,
+                "delete_album",
+                album["album_artist_id"],
+                operation_job_id,
+                json.dumps({"deleted_album_id": album["id"]}, sort_keys=True),
+                json.dumps(after, sort_keys=True),
+                "AUTOMATIC_EMPTY_ALBUM_SHELL_DELETION",
+                now,
+            ),
+        )
+        after["work_finished"] = True
+        return after
+
     @classmethod
     def _repair_contradictory_legacy_album_identity_tx(
         cls,
@@ -15268,6 +15430,15 @@ class NativeLibraryStore(PersistenceBase):
                         operation_job_id=job_id,
                         now=now,
                     )
+                if applied is None:
+                    applied = self._delete_orphaned_album_shell_tx(
+                        connection,
+                        album=album,
+                        operation_job_id=job_id,
+                        work_ordinal=ordinal,
+                        worker_id=worker_id,
+                        now=now,
+                    )
             changed = applied is not None
             catalog_revision = (
                 self._bump_catalog(connection)
@@ -15318,16 +15489,21 @@ class NativeLibraryStore(PersistenceBase):
                     result["reidentification_input_revision"] = input_revision
                     result["reidentification_job_id"] = reidentification_job_id
                     result["reidentification_job_created"] = created
-            self._finish_artist_reconciliation_work_tx(
-                connection,
-                job_id=job_id,
-                ordinal=ordinal,
-                worker_id=worker_id,
-                state="succeeded" if changed else "skipped",
-                result=result,
-                failure_code=None if changed else "NO_SAFE_CHANGE",
-                now=now,
-            )
+            # _delete_orphaned_album_shell_tx already finished (and removed)
+            # its own work lease before deleting the album row - by this
+            # point neither the lease nor the album exist, so the generic
+            # finish call below (which requires both) must be skipped.
+            if applied is None or not applied.get("work_finished"):
+                self._finish_artist_reconciliation_work_tx(
+                    connection,
+                    job_id=job_id,
+                    ordinal=ordinal,
+                    worker_id=worker_id,
+                    state="succeeded" if changed else "skipped",
+                    result=result,
+                    failure_code=None if changed else "NO_SAFE_CHANGE",
+                    now=now,
+                )
             self._bump_stream(connection, "operation")
             return result
 

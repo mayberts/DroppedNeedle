@@ -717,6 +717,74 @@ async def test_unique_empty_automatic_shell_retires_and_preserves_alias(
 
 
 @pytest.mark.asyncio
+async def test_empty_automatic_shell_with_no_successor_is_deleted(
+    store: NativeLibraryStore, db_path: Path
+) -> None:
+    """An automatic, empty shell with no other album to merge into (e.g. its
+    files were deleted outright, not retagged) has nothing to retire into -
+    it should be removed outright rather than lingering forever as an id
+    that resolves but 404s on every read (GH: album detail 404 loop)."""
+    pink_floyd = _artist("artist-pink-floyd", "Pink Floyd", 1)
+    shell_id = "album-orphan-shell"
+    await store.create_catalog_membership(
+        CatalogMembership(
+            album=LocalAlbum(
+                id=shell_id,
+                root_id="root-1",
+                grouping_key="stale-shell",
+                title="The Wall",
+                album_artist_id=pink_floyd.id,
+                album_artist_name="Pink Floyd",
+                created_at=2,
+                updated_at=2,
+            ),
+            artists=[pink_floyd],
+            album_credits=[
+                LocalArtistCredit(local_artist_id=pink_floyd.id, position=0)
+            ],
+        )
+    )
+
+    hygiene = CatalogIdentityHygieneService(store, clock=lambda: 3)
+    job = await hygiene.enqueue_backfill()
+    assert job is not None
+    claimed = await store.claim_operation_job(
+        "worker", now=3, lease_seconds=60, kind="repair"
+    )
+    assert claimed is not None
+
+    result = await hygiene.run_claimed(claimed, "worker")
+    assert result["state"] == "succeeded"
+
+    with sqlite3.connect(db_path) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM local_albums WHERE id = ?", (shell_id,)
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM library_operation_work WHERE local_album_id = ?",
+                (shell_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        action = connection.execute(
+            "SELECT local_artist_id, local_album_id FROM library_catalog_actions "
+            "WHERE reason_code = 'AUTOMATIC_EMPTY_ALBUM_SHELL_DELETION'"
+        ).fetchone()
+        assert action == (pink_floyd.id, None)
+        job_row = connection.execute(
+            "SELECT state, completed_count, succeeded_count FROM library_operation_jobs "
+            "WHERE id = ?",
+            (job["id"],),
+        ).fetchone()
+        assert job_row[1] == 1
+        assert job_row[2] == 1
+
+
+@pytest.mark.asyncio
 async def test_empty_shell_never_transfers_unproven_provider_identity(
     store: NativeLibraryStore, db_path: Path
 ) -> None:

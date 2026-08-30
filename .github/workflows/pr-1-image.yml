@@ -1,0 +1,64 @@
+name: PR Test Image
+
+# One-off image build for testing the album-404 fix (mayberts/DroppedNeedle#1)
+# in a compose file before it's merged. Publishes to this fork's own GHCR
+# namespace using the built-in GITHUB_TOKEN - no extra secrets required.
+# Safe to delete once the PR merges and the change ships in a real release.
+
+on:
+  push:
+    branches: [claude/droppedneedle-album-404-qsj34d]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    name: Build and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get short SHA
+        id: sha
+        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Get build date
+        id: date
+        run: echo "timestamp=$(git log -1 --pretty=%cI)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push (linux/amd64)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/droppedneedle:pr-1
+            ghcr.io/${{ github.repository_owner }}/droppedneedle:pr-1-${{ steps.sha.outputs.short }}
+          build-args: |
+            COMMIT_TAG=pr-1-${{ steps.sha.outputs.short }}
+            BUILD_DATE=${{ steps.date.outputs.timestamp }}
+          cache-from: type=gha,scope=pr-1-linux/amd64
+          cache-to: type=gha,mode=max,scope=pr-1-linux/amd64
+          provenance: false
