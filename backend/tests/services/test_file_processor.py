@@ -1308,6 +1308,81 @@ async def test_place_held_file_imports_bypassing_verify(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_place_held_file_release_track_mapping_is_complete_or_absent(
+    tmp_path: Path,
+):
+    """The shared publisher (library_management_publisher.py) requires
+    release_track_mbid/medium_position/release_track_position to be all-set or
+    all-None - a partial mapping (e.g. position known, MBID not) is rejected
+    with "An automatic import needs one complete release-track mapping."
+    _test_publisher is a fake that skips that validation, so this pins the
+    actual field values place_held_file hands to the publisher instead."""
+    from models.held_import import HeldImport
+
+    captured: list[object] = []
+
+    async def capturing_publish(bundle):
+        captured.extend(bundle.files)
+        paths = []
+        for request in bundle.files:
+            destination = tmp_path / "library" / request.destination_relative_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(request.input_path, destination)
+            paths.append(str(destination))
+        return LibraryManagementImportResult(
+            bundle_id="test-bundle", paths=tuple(paths), local_track_ids=()
+        )
+
+    fp, _manager, _client, _library, _downloads = _make_processor(
+        tmp_path, publisher=capturing_publish
+    )
+
+    def held_file(*, release_track_mbid: str | None, track_number: int) -> HeldImport:
+        held_dir = tmp_path / f"held-{release_track_mbid or 'none'}"
+        held_dir.mkdir()
+        source = held_dir / "src.flac"
+        shutil.copy(_FLAC, source)
+        return HeldImport(
+            id=1,
+            user_id="user-a",
+            held_path=str(source),
+            reason="fingerprint_mismatch",
+            source="usenet",
+            status="held",
+            created_at=0.0,
+            release_group_mbid="rg-9",
+            release_mbid="rel-9",
+            recording_mbid="rec-3",
+            release_track_mbid=release_track_mbid,
+            track_number=track_number,
+            disc_number=1,
+            track_title="Stepdad (intro)",
+            artist_name="Eminem",
+            album_title="Music to Be Murdered By",
+            naming_template=_TEMPLATE,
+        )
+
+    # AcoustID couldn't confirm the recording - release_track_mbid is unknown,
+    # even though the track/disc position (where it was expected in the
+    # tracklist) is. All three mapping fields must go out None together.
+    await fp.place_held_file(held_file(release_track_mbid=None, track_number=11))
+    unmapped = captured[-1]
+    assert unmapped.release_track_mbid is None
+    assert unmapped.medium_position is None
+    assert unmapped.release_track_position is None
+
+    # a held track that DOES carry a confirmed release-track MBID still keeps
+    # its full mapping. Different track_number so this lands at a different
+    # target path than the case above (place_held_file no-ops a re-import to
+    # an already-populated path).
+    await fp.place_held_file(held_file(release_track_mbid="track-12", track_number=12))
+    mapped = captured[-1]
+    assert mapped.release_track_mbid == "track-12"
+    assert mapped.medium_position == 1
+    assert mapped.release_track_position == 12
+
+
+@pytest.mark.asyncio
 async def test_place_held_file_without_library_root_raises_configuration_error(
     tmp_path: Path,
 ):
