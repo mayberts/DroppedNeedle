@@ -183,6 +183,28 @@
 			null
 	);
 	const hasEffectivePin = $derived(pinnedEdition !== null);
+
+	// The editions query and the album's own tracks query are fetched and
+	// cached independently. When the selected release changes - a user pin/
+	// clear/acquire, or the server picking a different "Automatic" edition on
+	// its own - only the editions query is guaranteed to reflect it; nothing
+	// invalidates the tracks query for that. Left alone, the header shows the
+	// new edition (e.g. "38 tracks") while the track list and its own count
+	// keep rendering the previous, possibly-smaller release. Once both sides
+	// know a selected release and they disagree, force one refresh to catch
+	// the tracks query up - guarded so a persistent disagreement can't loop.
+	let editionSyncRefreshed = $state(false);
+	$effect(() => {
+		const target = editionsQuery.data?.selected_release_mbid;
+		const current = tracksInfo?.selected_release_mbid;
+		if (!target || !current || target === current) {
+			editionSyncRefreshed = false;
+			return;
+		}
+		if (editionSyncRefreshed || loadingTracks) return;
+		editionSyncRefreshed = true;
+		onrefresh();
+	});
 	const editionActionLabel = $derived(
 		!libraryInLibrary
 			? 'Acquire this edition'

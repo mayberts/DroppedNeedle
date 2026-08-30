@@ -1,5 +1,5 @@
 import { page } from '@vitest/browser/context';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import { render } from 'vitest-browser-svelte';
 
 import type {
@@ -173,7 +173,7 @@ function renderHeader({
 	trackData = tracksInfo,
 	loadingTracks = false
 }: {
-	onrefresh?: () => void;
+	onrefresh?: Mock<() => void>;
 	libraryTrackCount?: number;
 	libraryBelowCutoff?: boolean;
 	localCopies?: LibraryAlbumSummary[];
@@ -259,6 +259,11 @@ describe('AlbumHeader automatic edition selection', () => {
 		await expect
 			.element(page.getByRole('button', { name: 'Acquire this edition' }))
 			.not.toBeInTheDocument();
+		// this fixture's editions.selected_release_mbid ('release-11') and
+		// tracksInfo.selected_release_mbid ('release-20') disagree from mount,
+		// which the auto-sync effect (below) already refreshed for on its own -
+		// clear that so this assertion isolates the pin-triggered refresh.
+		onrefresh.mockClear();
 		await trigger.click();
 		await expect.element(page.getByText('automatic', { exact: true })).toBeVisible();
 
@@ -288,6 +293,44 @@ describe('AlbumHeader automatic edition selection', () => {
 				})
 			)
 			.toBeVisible();
+	});
+
+	it('refreshes on its own when the server auto-selects a different edition than the loaded tracks', async () => {
+		// No pin/acquire click here - the server changed which release is
+		// "Automatic" (e.g. a better edition became available) with no user
+		// action. The editions query reflects it (release-20); tracksInfo is
+		// still the stale fetch for release-11 - the sync effect must catch
+		// this on its own rather than leaving the track list stuck on 11.
+		const editions = h.editions;
+		expect(editions).toBeDefined();
+		if (!editions) throw new Error('Expected edition data');
+		h.editions = { ...editions, selected_release_mbid: 'release-20' };
+		const onrefresh = renderHeader({
+			trackData: { ...tracksInfo, selected_release_mbid: 'release-11' }
+		});
+
+		await vi.waitFor(() => {
+			expect(onrefresh).toHaveBeenCalledOnce();
+		});
+	});
+
+	it('does not refresh once tracksInfo has already caught up to the selected edition', async () => {
+		const editions = h.editions;
+		expect(editions).toBeDefined();
+		if (!editions) throw new Error('Expected edition data');
+		h.editions = { ...editions, selected_release_mbid: 'release-20' };
+		const onrefresh = renderHeader({
+			trackData: { ...tracksInfo, selected_release_mbid: 'release-20' }
+		});
+
+		await expect
+			.element(
+				page.getByRole('button', {
+					name: 'Edition: Automatic · 2008 · US · 20 tracks'
+				})
+			)
+			.toBeVisible();
+		expect(onrefresh).not.toHaveBeenCalled();
 	});
 
 	it('offers to complete a partial edition', async () => {
