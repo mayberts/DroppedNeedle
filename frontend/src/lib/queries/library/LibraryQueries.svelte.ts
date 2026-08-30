@@ -6,7 +6,7 @@ import {
 } from '@tanstack/svelte-query';
 import type { Getter } from 'runed';
 import { API, CACHE_TTL } from '$lib/constants';
-import { api } from '$lib/api/client';
+import { api, ApiError } from '$lib/api/client';
 import { LibraryQueryKeyFactory } from './LibraryQueryKeyFactory';
 import type {
 	Album,
@@ -154,18 +154,40 @@ export const getLibraryRecentlyAddedQuery = () =>
 			api.global.get<NativeAlbumsResponse>(API.library.recentlyAdded(20), { signal })
 	}));
 
+// A query that has never had a successful fetch is always eligible to
+// refetch on the next subscribe, regardless of retry/refetchOnMount settings
+// - so whatever repeatedly resubscribes an open detail page (e.g. a stream
+// reconnect, a parent re-render) keeps re-hitting a definitively-404'd
+// album/artist id forever. Once we've confirmed via a real 404 that an id
+// doesn't exist, stop asking for the rest of this page load - id spaces are
+// stable per session, so this can't go stale under us; a hard refresh (or a
+// mutation-time cacheCanonicalLibraryAlbumDetail write, which populates the
+// cache directly) is the only way to un-hide it anyway.
+const knownMissingAlbumIds = new Set<string>();
+const knownMissingArtistIds = new Set<string>();
+
+function markMissingOn404(ids: Set<string>, id: string, error: unknown): never {
+	if (error instanceof ApiError && error.status === 404) ids.add(id);
+	throw error;
+}
+
 export const getLibraryAlbumDetailQueryOptions = (albumId: string) =>
 	queryOptions({
 		staleTime: CACHE_TTL.LIBRARY_NATIVE,
 		queryKey: LibraryQueryKeyFactory.albumDetail(albumId),
 		queryFn: ({ signal }) =>
-			api.global.get<LibraryAlbumDetail>(API.library.albumDetail(albumId), { signal })
+			api.global
+				.get<LibraryAlbumDetail>(API.library.albumDetail(albumId), { signal })
+				.catch((error) => markMissingOn404(knownMissingAlbumIds, albumId, error))
 	});
 
 export const getLibraryAlbumDetailQuery = (getAlbumId: Getter<string>) =>
 	createQuery(() => {
 		const albumId = getAlbumId();
-		return { ...getLibraryAlbumDetailQueryOptions(albumId), enabled: !!albumId };
+		return {
+			...getLibraryAlbumDetailQueryOptions(albumId),
+			enabled: !!albumId && !knownMissingAlbumIds.has(albumId)
+		};
 	});
 
 export const cacheCanonicalLibraryAlbumDetail = (album: LibraryAlbumDetail) =>
@@ -211,13 +233,18 @@ export const getLibraryArtistDetailQueryOptions = (artistId: string) =>
 		staleTime: CACHE_TTL.LIBRARY_NATIVE,
 		queryKey: LibraryQueryKeyFactory.artistDetail(artistId),
 		queryFn: ({ signal }) =>
-			api.global.get<LibraryArtistSummary>(API.library.artistDetail(artistId), { signal })
+			api.global
+				.get<LibraryArtistSummary>(API.library.artistDetail(artistId), { signal })
+				.catch((error) => markMissingOn404(knownMissingArtistIds, artistId, error))
 	});
 
 export const getLibraryArtistDetailQuery = (getArtistId: Getter<string>) =>
 	createQuery(() => {
 		const artistId = getArtistId();
-		return { ...getLibraryArtistDetailQueryOptions(artistId), enabled: !!artistId };
+		return {
+			...getLibraryArtistDetailQueryOptions(artistId),
+			enabled: !!artistId && !knownMissingArtistIds.has(artistId)
+		};
 	});
 
 export const cacheCanonicalLibraryArtistDetail = (artist: LibraryArtistSummary) =>

@@ -7,8 +7,20 @@ vi.mock('@tanstack/svelte-query', () => ({
 	keepPreviousData: vi.fn((data: unknown) => data)
 }));
 
+const MockApiError = vi.hoisted(
+	() =>
+		class MockApiError extends Error {
+			status: number;
+			constructor(status: number, message = 'error') {
+				super(message);
+				this.status = status;
+			}
+		}
+);
+
 vi.mock('$lib/api/client', () => ({
-	api: { global: { get: vi.fn(), post: vi.fn() } }
+	api: { global: { get: vi.fn(), post: vi.fn() } },
+	ApiError: MockApiError
 }));
 
 vi.mock('../QueryClient', () => ({
@@ -22,7 +34,9 @@ import {
 	getLibraryAlbumStatusQueryOptions,
 	getLibraryAlbumCopiesQuery,
 	getLibraryScanScheduleQuery,
-	getLibraryMembershipQueryOptions
+	getLibraryMembershipQueryOptions,
+	getLibraryAlbumDetailQuery,
+	getLibraryArtistDetailQuery
 } from './LibraryQueries.svelte';
 
 const mockGet = vi.mocked(api.global.get);
@@ -143,5 +157,65 @@ describe('library query endpoints', () => {
 		expect((mockPost.mock.calls[0][1] as { album_ids: string[] }).album_ids).toHaveLength(500);
 		expect((mockPost.mock.calls[1][1] as { album_ids: string[] }).album_ids).toEqual(['album-500']);
 		expect(result).toEqual({ owned_ids: ['album-000'], requested_ids: ['album-500'] });
+	});
+});
+
+// Regression coverage for the album/artist-detail 404 hammering bug: an id
+// that never had a successful fetch is always eligible to refetch on the
+// next resubscribe (whatever's driving that - see mayberts/DroppedNeedle#1
+// follow-up), so a confirmed 404 must disable the query outright rather than
+// rely on retry/refetchOnMount settings alone.
+describe('detail queries stop refetching a confirmed-missing id', () => {
+	it('album detail: disables the query after a 404, without touching other ids', async () => {
+		mockGet.mockRejectedValueOnce(new MockApiError(404));
+
+		const first = getLibraryAlbumDetailQuery(() => 'alb-missing') as unknown as {
+			enabled: boolean;
+			queryFn: (ctx: { signal: AbortSignal }) => Promise<unknown>;
+		};
+		expect(first.enabled).toBe(true);
+		await expect(callQueryFn(first)).rejects.toThrow();
+
+		const second = getLibraryAlbumDetailQuery(() => 'alb-missing') as unknown as {
+			enabled: boolean;
+		};
+		expect(second.enabled).toBe(false);
+
+		// a different, never-seen id is unaffected
+		const other = getLibraryAlbumDetailQuery(() => 'alb-other') as unknown as {
+			enabled: boolean;
+		};
+		expect(other.enabled).toBe(true);
+	});
+
+	it('artist detail: disables the query after a 404', async () => {
+		mockGet.mockRejectedValueOnce(new MockApiError(404));
+
+		const first = getLibraryArtistDetailQuery(() => 'art-missing') as unknown as {
+			enabled: boolean;
+			queryFn: (ctx: { signal: AbortSignal }) => Promise<unknown>;
+		};
+		expect(first.enabled).toBe(true);
+		await expect(callQueryFn(first)).rejects.toThrow();
+
+		const second = getLibraryArtistDetailQuery(() => 'art-missing') as unknown as {
+			enabled: boolean;
+		};
+		expect(second.enabled).toBe(false);
+	});
+
+	it('does not suppress refetching after a non-404 error (e.g. a transient 500)', async () => {
+		mockGet.mockRejectedValueOnce(new MockApiError(500));
+
+		const first = getLibraryAlbumDetailQuery(() => 'alb-flaky') as unknown as {
+			enabled: boolean;
+			queryFn: (ctx: { signal: AbortSignal }) => Promise<unknown>;
+		};
+		await expect(callQueryFn(first)).rejects.toThrow();
+
+		const second = getLibraryAlbumDetailQuery(() => 'alb-flaky') as unknown as {
+			enabled: boolean;
+		};
+		expect(second.enabled).toBe(true);
 	});
 });
