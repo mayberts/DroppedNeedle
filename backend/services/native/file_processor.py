@@ -1688,6 +1688,14 @@ class FileProcessor:
                 # is a validated redundant no-op - consume it off the event loop.
                 await asyncio.to_thread(source.unlink, True)
                 return target_path
+        # The publisher requires release_track_mbid/medium_position/release_track_position
+        # to be all-set or all-None (one complete release-track mapping, or none at all -
+        # see library_management_publisher.py). held.release_track_mbid is None whenever
+        # AcoustID couldn't confirm the recording (the whole reason this is a manual
+        # override), so position info can't be claimed as part of a mapping either here -
+        # the file still lands at the right path via target_tag/target_path above, which
+        # is keyed off held.track_number/disc_number directly.
+        mapped = held.release_track_mbid is not None
         published = await self._publish_planned_imports(
             [
                 _PlannedImport(
@@ -1698,10 +1706,15 @@ class FileProcessor:
                     release_group_mbid=held.release_group_mbid,
                     release_mbid=held.release_mbid,
                     recording_mbid=target_tag.musicbrainz_recording_id,
-                    release_track_mbid=None,
-                    medium_position=held.disc_number or 1,
-                    release_track_position=held.track_number,
-                    authoritative_mapping=bool(held.release_mbid and held.track_number),
+                    release_track_mbid=held.release_track_mbid,
+                    medium_position=(held.disc_number or 1) if mapped else None,
+                    release_track_position=held.track_number if mapped else None,
+                    authoritative_mapping=bool(
+                        held.release_mbid
+                        and held.release_track_mbid
+                        and held.recording_mbid
+                        and held.track_number
+                    ),
                     confidence=1.0,
                     download_task_id=held.source_task_id,
                     source_path=held.held_path,
